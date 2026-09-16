@@ -1,0 +1,7 @@
+# build artifacts
+/bin/
+*.test
+*.log
+
+# macOS
+.DS_Store
