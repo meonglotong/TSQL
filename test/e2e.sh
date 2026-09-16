@@ -112,6 +112,22 @@ done
 wait $pids
 assert "SELECT count(*) FROM depts" "6" "multi-client"
 
+# --- Fase v2: LEFT JOIN + HAVING + IN + subqueries ---------------------------
+assert "CREATE TABLE v2u (id INT PRIMARY KEY, name TEXT, dept TEXT)" "OK (0 rows)" "v2-create"
+assert "INSERT INTO v2u VALUES (1, 'alfa', 'eng'), (2, 'beta', 'eng'), (3, 'cuki', 'sales')" "OK (3 rows)" "v2-seed"
+assert "CREATE TABLE v2o (id INT PRIMARY KEY, uid INT, amt FLOAT)" "OK (0 rows)" "v2-create-o"
+assert "INSERT INTO v2o VALUES (10, 1, 100.0), (11, 2, 50.0), (12, 4, 25.0)" "OK (3 rows)" "v2-seed-o"
+assert "SELECT u.name, o.amt FROM v2u u LEFT JOIN v2o o ON o.uid = u.id WHERE o.amt IS NULL" "cuki" "left-join-null"
+assert "SELECT dept, count(*) FROM v2u GROUP BY dept HAVING count(*) > 1 ORDER BY dept" "eng | 2" "having"
+assert "SELECT name FROM v2u WHERE id IN (1, 3) ORDER BY id" "alfa" "in-list"
+assert "SELECT name FROM v2u WHERE name NOT IN ('alfa', 'beta')" "cuki" "not-in-list"
+assert "SELECT name FROM v2u WHERE id IN (SELECT uid FROM v2o) ORDER BY id" "alfa" "in-subquery"
+assert "SELECT name FROM v2u WHERE name IN (SELECT name FROM v2u WHERE dept = 'sales')" "cuki" "in-subquery-text"
+assert "SELECT count(*) FROM (SELECT id FROM v2u WHERE id > 0) s" "3" "from-subquery"
+assert_fail "SELECT name FROM (SELECT id FROM v2u)" "derived-no-alias"
+assert "UPDATE v2u SET dept = 'hr' WHERE id IN (SELECT uid FROM v2o)" "OK (2 rows)" "update-in-subquery"
+assert "SELECT dept FROM v2u WHERE id = 3" "sales" "update-in-subquery-check"
+
 # --- crash recovery: kill -9, restart, data must survive ---------------------
 kill -9 "$DAEMON_PID" 2>/dev/null || true
 wait "$DAEMON_PID" 2>/dev/null || true

@@ -593,3 +593,142 @@ func TestUniqueFloatCoerce(t *testing.T) {
 	}
 	mustErr(t, e, "INSERT INTO f VALUES (2, 5)", "23505") // 5 == 5.0
 }
+
+// --- v2: LEFT JOIN, HAVING, subqueries, IN -----------------------------------
+
+func TestLeftJoin(t *testing.T) {
+	e := newEng(t)
+	run(t, e, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+	run(t, e, "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, amount FLOAT)")
+	run(t, e, "INSERT INTO users (id, name) VALUES (1, 'alfa'), (2, 'beta')")
+	run(t, e, "INSERT INTO orders (id, user_id, amount) VALUES (10, 1, 100.0), (11, 1, 50.0), (12, 3, 75.0)")
+
+	// beta has no orders; user 3's order has no user
+	r := run(t, e, "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON o.user_id = u.id ORDER BY u.id, o.amount")
+	if len(r.Rows) != 3 {
+		t.Fatalf("rows = %d, want 3: %+v", len(r.Rows), r.Rows)
+	}
+	if r.Rows[0][0].S != "alfa" || r.Rows[0][1].F != 50 {
+		t.Errorf("row0 = %+v", r.Rows[0])
+	}
+	if r.Rows[2][0].S != "beta" || !r.Rows[2][1].IsNull() {
+		t.Errorf("row2 (unmatched left row) = %+v", r.Rows[2])
+	}
+
+	// aggregates over the left join: beta counts 0 orders
+	r2 := run(t, e, "SELECT u.name, count(o.id) FROM users u LEFT JOIN orders o ON o.user_id = u.id GROUP BY u.name ORDER BY u.name")
+	if len(r2.Rows) != 2 || r2.Rows[0][0].S != "alfa" || r2.Rows[0][1].I != 2 ||
+		r2.Rows[1][0].S != "beta" || r2.Rows[1][1].I != 0 {
+		t.Fatalf("agg rows = %+v", r2.Rows)
+	}
+}
+
+func TestHaving(t *testing.T) {
+	e := newEng(t)
+	run(t, e, "CREATE TABLE t (id INT PRIMARY KEY, dept TEXT, v INT)")
+	run(t, e, "INSERT INTO t VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 5), (4, 'c', 7), (5, 'c', 9)")
+
+	// HAVING count(*) > 1 keeps a and c, drops b
+	r := run(t, e, "SELECT dept, count(*) FROM t GROUP BY dept HAVING count(*) > 1 ORDER BY dept")
+	if len(r.Rows) != 2 || r.Rows[0][0].S != "a" || r.Rows[0][1].I != 2 || r.Rows[1][0].S != "c" || r.Rows[1][1].I != 2 {
+		t.Fatalf("rows = %+v", r.Rows)
+	}
+
+	// HAVING on an aggregate of a grouped column
+	r2 := run(t, e, "SELECT dept, sum(v) FROM t GROUP BY dept HAVING sum(v) > 15 ORDER BY dept")
+	if len(r2.Rows) != 2 || r2.Rows[0][0].S != "a" || r2.Rows[0][1].I != 30 || r2.Rows[1][0].S != "c" || r2.Rows[1][1].I != 16 {
+		t.Fatalf("rows = %+v", r2.Rows)
+	}
+
+	// HAVING without GROUP BY: one implicit group
+	r3 := run(t, e, "SELECT count(*) FROM t HAVING count(*) > 3")
+	if len(r3.Rows) != 1 || r3.Rows[0][0].I != 5 {
+		t.Fatalf("rows = %+v", r3.Rows)
+	}
+
+	// a non-grouped column in HAVING is rejected
+	mustErr(t, e, "SELECT dept, v FROM t GROUP BY dept HAVING v > 1", "42803")
+	// HAVING on an empty table: no rows survive
+	run(t, e, "CREATE TABLE empty (id INT PRIMARY KEY)")
+	r4 := run(t, e, "SELECT count(*) FROM empty HAVING count(*) > 0")
+	if len(r4.Rows) != 0 {
+		t.Fatalf("rows = %+v", r4.Rows)
+	}
+}
+
+func TestFromSubquery(t *testing.T) {
+	e := newEng(t)
+	run(t, e, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, dept TEXT)")
+	run(t, e, "INSERT INTO users VALUES (1, 'alfa', 'eng'), (2, 'beta', 'eng'), (3, 'cuki', 'sales')")
+
+	// derived table filters rows
+	r := run(t, e, "SELECT name FROM (SELECT id, name FROM users WHERE dept = 'eng') s ORDER BY id")
+	if len(r.Rows) != 2 || r.Rows[0][0].S != "alfa" || r.Rows[1][0].S != "beta" {
+		t.Fatalf("rows = %+v", r.Rows)
+	}
+
+	// derived table feeds an aggregate
+	r2 := run(t, e, "SELECT count(*) FROM (SELECT dept FROM users) s")
+	if len(r2.Rows) != 1 || r2.Rows[0][0].I != 3 {
+		t.Fatalf("rows = %+v", r2.Rows)
+	}
+
+	// derived table can be joined
+	run(t, e, "CREATE TABLE depts (id INT PRIMARY KEY, code TEXT)")
+	run(t, e, "INSERT INTO depts VALUES (1, 'eng'), (3, 'sales')")
+	r3 := run(t, e, "SELECT s.name, d.code FROM (SELECT id, name FROM users) s JOIN depts d ON d.id = s.id ORDER BY s.id")
+	if len(r3.Rows) != 2 || r3.Rows[0][0].S != "alfa" || r3.Rows[0][1].S != "eng" || r3.Rows[1][0].S != "cuki" || r3.Rows[1][1].S != "sales" {
+		t.Fatalf("rows = %+v", r3.Rows)
+	}
+
+	// nested derived tables
+	r4 := run(t, e, "SELECT count(*) FROM (SELECT count(*) FROM (SELECT id FROM users WHERE id > 0) i) o")
+	if len(r4.Rows) != 1 || r4.Rows[0][0].I != 1 {
+		t.Fatalf("rows = %+v", r4.Rows)
+	}
+}
+
+func TestIn(t *testing.T) {
+	e := newEng(t)
+	run(t, e, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+	run(t, e, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')")
+
+	// literal list
+	r := run(t, e, "SELECT name FROM t WHERE id IN (3, 1) ORDER BY id")
+	if len(r.Rows) != 2 || r.Rows[0][0].S != "a" || r.Rows[1][0].S != "c" {
+		t.Fatalf("rows = %+v", r.Rows)
+	}
+	r2 := run(t, e, "SELECT name FROM t WHERE id NOT IN (1, 3) ORDER BY id")
+	if len(r2.Rows) != 2 || r2.Rows[0][0].S != "b" || r2.Rows[1][0].S != "d" {
+		t.Fatalf("rows = %+v", r2.Rows)
+	}
+
+	// IN subquery
+	run(t, e, "CREATE TABLE keep (id INT PRIMARY KEY)")
+	run(t, e, "INSERT INTO keep VALUES (1), (3)")
+	r3 := run(t, e, "SELECT name FROM t WHERE id IN (SELECT id FROM keep) ORDER BY id")
+	if len(r3.Rows) != 2 || r3.Rows[0][0].S != "a" || r3.Rows[1][0].S != "c" {
+		t.Fatalf("rows = %+v", r3.Rows)
+	}
+
+	// NOT IN subquery; empty subquery result
+	r4 := run(t, e, "SELECT name FROM t WHERE id NOT IN (SELECT id FROM keep) ORDER BY id")
+	if len(r4.Rows) != 2 || r4.Rows[0][0].S != "b" || r4.Rows[1][0].S != "d" {
+		t.Fatalf("rows = %+v", r4.Rows)
+	}
+	r5 := run(t, e, "SELECT name FROM t WHERE id IN (SELECT id FROM keep WHERE id = 99) ORDER BY id")
+	if len(r5.Rows) != 0 {
+		t.Fatalf("rows = %+v", r5.Rows)
+	}
+	r6 := run(t, e, "SELECT name FROM t WHERE id NOT IN (SELECT id FROM keep WHERE id = 99) ORDER BY id")
+	if len(r6.Rows) != 4 {
+		t.Fatalf("rows = %+v", r6.Rows)
+	}
+
+	// IN inside a WHERE on an UPDATE
+	run(t, e, "UPDATE t SET name = 'X' WHERE id IN (SELECT id FROM keep)")
+	r7 := run(t, e, "SELECT count(*) FROM t WHERE name = 'X'")
+	if r7.Rows[0][0].I != 2 {
+		t.Fatalf("rows = %+v", r7.Rows)
+	}
+}

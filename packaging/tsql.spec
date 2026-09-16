@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           tsql
-Version:        0.3.1
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        TSQL (tamamiSQL): a small relational SQL database server in Go
 License:        MIT

@@ -366,3 +366,108 @@ func TestParseFuncErrors(t *testing.T) {
 		t.Errorf("sum() shape wrong: %+v", st)
 	}
 }
+
+// --- v2: LEFT JOIN, HAVING, subqueries, IN ---------------------------------
+
+func TestParseLeftJoin(t *testing.T) {
+	st, ok := mustParse(t, "SELECT a.x FROM a LEFT JOIN b ON a.id = b.aid").(*Select)
+	if !ok {
+		t.Fatal("not a Select")
+	}
+	if len(st.Tables) != 2 || len(st.JoinKinds) != 1 || st.JoinKinds[0] != "left" {
+		t.Fatalf("got Tables=%v JoinKinds=%v", st.Tables, st.JoinKinds)
+	}
+	st2, ok := mustParse(t, "SELECT a.x FROM a LEFT OUTER JOIN b ON a.id = b.aid").(*Select)
+	if !ok || st2.JoinKinds[0] != "left" {
+		t.Fatalf("LEFT OUTER JOIN: %+v", st2.JoinKinds)
+	}
+	st3, ok := mustParse(t, "SELECT a.x FROM a INNER JOIN b ON a.id = b.aid").(*Select)
+	if !ok || st3.JoinKinds[0] != "inner" {
+		t.Fatalf("INNER JOIN: %+v", st3.JoinKinds)
+	}
+	st4, ok := mustParse(t, "SELECT a.x FROM a JOIN b ON a.id = b.aid JOIN c ON c.id = b.id").(*Select)
+	if !ok || len(st4.JoinKinds) != 2 || st4.JoinKinds[0] != "inner" || st4.JoinKinds[1] != "inner" {
+		t.Fatalf("multi join: %+v", st4.JoinKinds)
+	}
+}
+
+func TestParseHaving(t *testing.T) {
+	st, ok := mustParse(t, "SELECT dept, count(*) FROM t GROUP BY dept HAVING count(*) > 1 ORDER BY dept LIMIT 5").(*Select)
+	if !ok {
+		t.Fatal("not a Select")
+	}
+	if st.Having == nil {
+		t.Fatal("Having is nil")
+	}
+	cmp, ok := st.Having.(*Cmp)
+	if !ok || cmp.Op != ">" {
+		t.Fatalf("Having = %+v", st.Having)
+	}
+	fn, ok := cmp.L.(*Func)
+	if !ok || fn.Name != "count" || !fn.Star {
+		t.Fatalf("Having.L = %+v", cmp.L)
+	}
+	// HAVING without GROUP BY must also parse
+	if _, err := Parse("SELECT count(*) FROM t HAVING count(*) > 3"); err != nil {
+		t.Errorf("Parse: %v", err)
+	}
+}
+
+func TestParseFromSubquery(t *testing.T) {
+	st, ok := mustParse(t, "SELECT name FROM (SELECT id, name FROM users WHERE score > 1) s").(*Select)
+	if !ok {
+		t.Fatal("not a Select")
+	}
+	tr := st.Tables[0]
+	if tr.Sub == nil || tr.Alias != "s" || tr.Table != "" {
+		t.Fatalf("derived table: %+v", tr)
+	}
+	inner := tr.Sub.Tables[0].Table
+	if inner != "users" {
+		t.Fatalf("inner table: %q", inner)
+	}
+	// derived table may be joined
+	st2, ok := mustParse(t, "SELECT s.name FROM (SELECT id, name FROM users) s JOIN depts d ON d.id = s.id").(*Select)
+	if !ok || len(st2.Tables) != 2 || st2.Tables[0].Sub == nil {
+		t.Fatalf("join with derived: %+v", st2.Tables)
+	}
+	// a derived table must have an alias
+	if _, err := Parse("SELECT * FROM (SELECT id FROM users)"); err == nil {
+		t.Error("derived table without alias should fail")
+	}
+}
+
+func TestParseIn(t *testing.T) {
+	st, ok := mustParse(t, "SELECT id FROM t WHERE id IN (1, 2, 3)").(*Select)
+	if !ok {
+		t.Fatal("not a Select")
+	}
+	in, ok := st.Where.(*InList)
+	if !ok || in.Not || len(in.List) != 3 {
+		t.Fatalf("Where = %+v", st.Where)
+	}
+	st2, ok := mustParse(t, "SELECT id FROM t WHERE id NOT IN (1)").(*Select)
+	if !ok {
+		t.Fatal("not a Select")
+	}
+	in2, ok := st2.Where.(*InList)
+	if !ok || !in2.Not || len(in2.List) != 1 {
+		t.Fatalf("Where = %+v", st2.Where)
+	}
+	st3, ok := mustParse(t, "SELECT id FROM t WHERE id IN (SELECT id FROM x)").(*Select)
+	if !ok {
+		t.Fatal("not a Select")
+	}
+	in3, ok := st3.Where.(*InSub)
+	if !ok || in3.Not || in3.Sub == nil {
+		t.Fatalf("Where = %+v", st3.Where)
+	}
+	st4, ok := mustParse(t, "SELECT id FROM t WHERE id NOT IN (SELECT id FROM x)").(*Select)
+	if !ok {
+		t.Fatal("not a Select")
+	}
+	in4, ok := st4.Where.(*InSub)
+	if !ok || !in4.Not {
+		t.Fatalf("Where = %+v", st4.Where)
+	}
+}

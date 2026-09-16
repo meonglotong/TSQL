@@ -6,9 +6,9 @@
 //	colDef   := ident typeName { PRIMARY KEY | NOT NULL | AUTO_INCREMENT | UNIQUE }*
 //	drop     := DROP TABLE [IF EXISTS] ident
 //	insert   := INSERT INTO ident ['(' ident (',' ident)* ')'] VALUES tuple (',' tuple)*
-//	select   := SELECT selectList FROM tableRef {[INNER] JOIN tableRef ON expr}
-//	           [WHERE expr] [GROUP BY exprList] [ORDER BY orderList] [LIMIT int]
-//	tableRef := ident [AS] [ident]
+//	select   := SELECT selectList FROM tableRef {[INNER|LEFT [OUTER]] JOIN tableRef ON expr}
+//	           [WHERE expr] [GROUP BY exprList] [HAVING expr] [ORDER BY orderList] [LIMIT int]
+//	tableRef := ident [AS] [ident] | '(' select ')' ident   (derived table, alias required)
 //	update   := UPDATE ident SET ident '=' expr (',' ident '=' expr)* [WHERE expr]
 //	delete   := DELETE FROM ident [WHERE expr]
 //	txn      := BEGIN | START TRANSACTION | COMMIT | ROLLBACK
@@ -76,22 +76,25 @@ type Insert struct {
 }
 
 // TableRef is one table in a FROM clause, with its alias (defaults to the
-// table name).
+// table name). Sub != nil marks a derived table: "(SELECT ...) alias".
 type TableRef struct {
 	Table string
 	Alias string
+	Sub   *Select
 }
 
 // Select is SELECT.
 type Select struct {
-	Tables []TableRef // FROM + joined tables, in order
-	On     []Expr     // ON expr for Tables[i+1], aligned: On[i] joins Tables[i+1]
-	Star   bool
-	Fields []Expr // ignored when Star
-	Where  Expr
-	Group  []Expr // v1: column references only
-	Order  []OrderTerm
-	Limit  *int64
+	Tables    []TableRef // FROM + joined tables, in order
+	On        []Expr     // ON expr for Tables[i+1], aligned: On[i] joins Tables[i+1]
+	JoinKinds []string   // aligned with On: "inner" (default) or "left"
+	Star      bool
+	Fields    []Expr // ignored when Star
+	Where     Expr
+	Group     []Expr // v1: column references only
+	Having    Expr   // filter on groups/aggregates
+	Order     []OrderTerm
+	Limit     *int64
 }
 
 // OrderTerm is one ORDER BY item (column ref or aggregate in v1).
@@ -181,6 +184,23 @@ type Binary struct {
 	Op   string
 	L, R Expr
 }
+
+// InList is `expr [NOT] IN (literal, ...)`.
+type InList struct {
+	X    Expr
+	List []Expr // literals in v2
+	Not  bool
+}
+
+// InSub is `expr [NOT] IN (SELECT ...)`.
+type InSub struct {
+	X   Expr
+	Sub *Select
+	Not bool
+}
+
+func (*InList) expr() {}
+func (*InSub) expr()  {}
 
 // IsAggregateFunc reports whether the name is a v1 aggregate function.
 func IsAggregateFunc(name string) bool {
@@ -385,6 +405,7 @@ var refStopWords = map[string]bool{
 	"where": true, "group": true, "order": true, "limit": true,
 	"join": true, "inner": true, "left": true, "right": true,
 	"outer": true, "cross": true, "on": true, "having": true,
+	"in": true, "not": true,
 }
 
 func (p *parser) parseStatement() (Statement, error) {
@@ -589,8 +610,35 @@ func (p *parser) parseInsert() (*Insert, error) {
 	return st, nil
 }
 
-// parseTableRef parses `ident [AS] [ident]` — a table with an optional alias.
+// parseTableRef parses `ident [AS] [ident]` — a table with an optional
+// alias — or `(SELECT ...) ident`, a derived table whose alias is required.
 func (p *parser) parseTableRef() (TableRef, error) {
+	if p.atPunct("(") {
+		p.next() // (
+		if !p.atKw("select") {
+			return TableRef{}, p.errf("expected SELECT in derived table")
+		}
+		sub, err := p.parseSelect()
+		if err != nil {
+			return TableRef{}, err
+		}
+		if err := p.expectPunct(")"); err != nil {
+			return TableRef{}, err
+		}
+		var alias string
+		if p.takeKw("as") {
+			alias, err = p.identOrErr("derived table alias")
+		} else if p.peek().kind == tokIdent && !refStopWords[p.peek().text] {
+			alias, err = p.identOrErr("derived table alias")
+		}
+		if err != nil {
+			return TableRef{}, err
+		}
+		if alias == "" {
+			return TableRef{}, p.errf("derived table requires an alias")
+		}
+		return TableRef{Alias: alias, Sub: sub}, nil
+	}
 	name, err := p.identOrErr("table name")
 	if err != nil {
 		return TableRef{}, err
@@ -640,19 +688,32 @@ func (p *parser) parseSelect() (*Select, error) {
 		return nil, err
 	}
 	st.Tables = append(st.Tables, ref)
+joinLoop:
 	for {
-		if p.atKw("join") {
+		kind := "inner"
+		switch {
+		case p.atKw("join"):
 			p.next() // join
-		} else if p.atKw("inner") {
+		case p.atKw("inner"):
 			save := p.i
 			p.next()
 			if !p.atKw("join") {
 				p.i = save // dangling INNER: restore, top-level will error
-				break
+				break joinLoop
 			}
 			p.next() // join
-		} else {
-			break
+		case p.atKw("left"):
+			save := p.i
+			p.next()
+			p.takeKw("outer")
+			if !p.atKw("join") {
+				p.i = save // dangling LEFT: restore, top-level will error
+				break joinLoop
+			}
+			p.next() // join
+			kind = "left"
+		default:
+			break joinLoop
 		}
 		ref, err := p.parseTableRef()
 		if err != nil {
@@ -667,6 +728,7 @@ func (p *parser) parseSelect() (*Select, error) {
 		}
 		st.Tables = append(st.Tables, ref)
 		st.On = append(st.On, on)
+		st.JoinKinds = append(st.JoinKinds, kind)
 	}
 	if p.atKw("where") {
 		p.next()
@@ -693,6 +755,14 @@ func (p *parser) parseSelect() (*Select, error) {
 			}
 			break
 		}
+	}
+	if p.atKw("having") {
+		p.next()
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		st.Having = e
 	}
 	if p.atKw("order") {
 		p.next()
@@ -866,7 +936,50 @@ func (p *parser) parseCmp() (Expr, error) {
 		}
 		return &IsNull{X: l, Not: not}, nil
 	}
-	return l, nil
+	// IN ( literal list | SELECT ... ) with optional NOT.
+	isNotIn := false
+	if p.atKw("not") {
+		save := p.i
+		p.next()
+		if !p.atKw("in") {
+			p.i = save // bare NOT here is not IN; top level will sort it out
+			return l, nil
+		}
+		isNotIn = true
+	} else if !p.atKw("in") {
+		return l, nil
+	}
+	p.next() // in
+	if err := p.expectPunct("("); err != nil {
+		return nil, err
+	}
+	if p.atKw("select") {
+		sub, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectPunct(")"); err != nil {
+			return nil, err
+		}
+		return &InSub{X: l, Sub: sub, Not: isNotIn}, nil
+	}
+	var list []Expr
+	for {
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, e)
+		if p.atPunct(",") {
+			p.next()
+			continue
+		}
+		break
+	}
+	if err := p.expectPunct(")"); err != nil {
+		return nil, err
+	}
+	return &InList{X: l, List: list, Not: isNotIn}, nil
 }
 
 func (p *parser) parseAdd() (Expr, error) {

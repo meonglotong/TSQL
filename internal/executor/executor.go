@@ -113,6 +113,7 @@ type joinTable struct {
 	alias   string
 	basePos int // first column position in the joined row
 	colIdx  map[string]int
+	rows    [][]types.Value // preloaded rows for derived tables (nil = load from storage)
 }
 
 // joinScope resolves column references across joined tables.
@@ -223,6 +224,19 @@ func validateExpr(sc *joinScope, e parser.Expr) error {
 			return err
 		}
 		return validateExpr(sc, x.R)
+	case *parser.InList:
+		if err := validateExpr(sc, x.X); err != nil {
+			return err
+		}
+		for _, le := range x.List {
+			if _, ok := le.(*parser.Lit); !ok {
+				return sqlErr("42601", "IN list must contain literals in v2")
+			}
+		}
+		return nil
+	case *parser.InSub:
+		// The subquery is validated when it executes.
+		return validateExpr(sc, x.X)
 	}
 	return nil
 }
@@ -631,11 +645,15 @@ func uniqueEquality(where parser.Expr, alias string, def *schema.TableDef) (int,
 	return 0, nil, false
 }
 
-// collectJoined loads all FROM tables, runs the left-deep nested-loop join,
-// and applies the WHERE filter.
+// collectJoined loads all FROM tables, runs the left-deep nested-loop join
+// (INNER or LEFT per s.JoinKinds), and applies the WHERE filter.
 func collectJoined(acc storage.Accessor, sc *joinScope, s *parser.Select) ([][]types.Value, error) {
 	tableRows := make([][][]types.Value, len(sc.tables))
 	for i := range sc.tables {
+		if sc.tables[i].rows != nil { // derived table: already materialized
+			tableRows[i] = sc.tables[i].rows
+			continue
+		}
 		_, rows, err := acc.AllRows(sc.tables[i].def.Name)
 		if err != nil {
 			return nil, err
@@ -646,8 +664,10 @@ func collectJoined(acc storage.Accessor, sc *joinScope, s *parser.Select) ([][]t
 	for i := 1; i < len(sc.tables); i++ {
 		partial := sc.sub(i + 1)
 		on := s.On[i-1]
+		left := s.JoinKinds[i-1] == "left"
 		next := make([][]types.Value, 0, len(joined))
 		for _, lrow := range joined {
+			matched := false
 			for _, rrow := range tableRows[i] {
 				full := make([]types.Value, 0, len(lrow)+len(rrow))
 				full = append(full, lrow...)
@@ -658,7 +678,17 @@ func collectJoined(acc storage.Accessor, sc *joinScope, s *parser.Select) ([][]t
 				}
 				if b && !isNull {
 					next = append(next, full)
+					matched = true
 				}
+			}
+			if left && !matched {
+				// LEFT JOIN: keep the left row, NULL-pad the right side.
+				full := make([]types.Value, 0, len(lrow)+len(sc.tables[i].def.Cols))
+				full = append(full, lrow...)
+				for j := 0; j < len(sc.tables[i].def.Cols); j++ {
+					full = append(full, types.Null())
+				}
+				next = append(next, full)
 			}
 		}
 		joined = next
@@ -685,18 +715,55 @@ func execSelect(acc storage.Accessor, s *parser.Select) (*Result, error) {
 	seenAlias := map[string]bool{}
 	basePos := 0
 	for _, tr := range s.Tables {
-		def, err := tableDef(acc, tr.Table)
-		if err != nil {
-			return nil, err
+		var def *schema.TableDef
+		var preloaded [][]types.Value
+		if tr.Sub != nil {
+			// Derived table: run the inner SELECT and adopt its result.
+			res, err := execSelect(acc, tr.Sub)
+			if err != nil {
+				return nil, err
+			}
+			def = derivedDef(tr.Alias, res)
+			preloaded = res.Rows
+		} else {
+			d, err := tableDef(acc, tr.Table)
+			if err != nil {
+				return nil, err
+			}
+			def = d
 		}
 		if seenAlias[tr.Alias] {
 			return nil, sqlErr("42703", fmt.Sprintf("table alias %q specified more than once", tr.Alias))
 		}
 		seenAlias[tr.Alias] = true
-		jtables = append(jtables, joinTable{def: def, alias: tr.Alias, basePos: basePos, colIdx: colIndexMap(def)})
+		jtables = append(jtables, joinTable{def: def, alias: tr.Alias, basePos: basePos, colIdx: colIndexMap(def), rows: preloaded})
 		basePos += len(def.Cols)
 	}
 	sc := &joinScope{tables: jtables}
+
+	// Materialize IN subqueries into literal lists before validation/scan
+	// (v2: non-correlated, single column).
+	if s.Where != nil {
+		w, err := resolveInSubqueries(acc, s.Where)
+		if err != nil {
+			return nil, err
+		}
+		s.Where = w
+	}
+	if s.Having != nil {
+		h, err := resolveInSubqueries(acc, s.Having)
+		if err != nil {
+			return nil, err
+		}
+		s.Having = h
+	}
+	for i := range s.On {
+		on, err := resolveInSubqueries(acc, s.On[i])
+		if err != nil {
+			return nil, err
+		}
+		s.On[i] = on
+	}
 
 	// Validate join conditions against the left-deep prefix including the
 	// table being joined (an ON may reference both sides of the join).
@@ -735,7 +802,13 @@ func execSelect(acc storage.Accessor, s *parser.Select) (*Result, error) {
 			break
 		}
 	}
-	grouping := len(groupPos) > 0 || hasAgg
+	grouping := len(groupPos) > 0 || hasAgg || s.Having != nil
+
+	if s.Having != nil {
+		if err := validateHaving(sc, s.Having, groupPosSet); err != nil {
+			return nil, err
+		}
+	}
 
 	plans, headers, err := sc.planFields(s, grouping, groupPosSet)
 	if err != nil {
@@ -791,10 +864,10 @@ func execSelect(acc storage.Accessor, s *parser.Select) (*Result, error) {
 		}
 	}
 
-	// Candidate rows: UNIQUE-index shortcut for single-table equality lookups,
-	// nested-loop join otherwise.
+	// Candidate rows: UNIQUE-index shortcut for single-table equality lookups
+	// (real tables only), nested-loop join otherwise.
 	var filtered [][]types.Value
-	if len(jtables) == 1 {
+	if len(jtables) == 1 && jtables[0].rows == nil {
 		if ci, lit, ok := uniqueEquality(s.Where, jtables[0].alias, jtables[0].def); ok {
 			// Exactly one row can match; the index says which.
 			if lit != nil {
@@ -922,6 +995,20 @@ func execSelect(acc storage.Accessor, s *parser.Select) (*Result, error) {
 	// (count -> 0, sum/avg/min/max -> NULL), matching PostgreSQL.
 	if len(groupPos) == 0 && len(groups) == 0 {
 		groups = append(groups, grp{})
+	}
+	// HAVING filters groups before ORDER BY / LIMIT (SQL order of operations).
+	if s.Having != nil {
+		kept := make([]grp, 0, len(groups))
+		for i := range groups {
+			b, isNull, err := evalBoolCtx(sc, s.Having, groups[i].repr, &groupCtx{rows: groups[i].rows, nowVal: nowVal})
+			if err != nil {
+				return nil, err
+			}
+			if b && !isNull {
+				kept = append(kept, groups[i])
+			}
+		}
+		groups = kept
 	}
 	if len(orderPlans) > 0 {
 		keys := make([][]types.Value, len(groups))
@@ -1079,6 +1166,11 @@ func execUpdate(acc storage.Accessor, s *parser.Update) (*Result, error) {
 		}
 	}
 	if s.Where != nil {
+		w, err := resolveInSubqueries(acc, s.Where)
+		if err != nil {
+			return nil, err
+		}
+		s.Where = w
 		if err := validateExpr(sc, s.Where); err != nil {
 			return nil, err
 		}
@@ -1144,6 +1236,11 @@ func execDelete(acc storage.Accessor, s *parser.Delete) (*Result, error) {
 	}
 	sc := singleTableScope(def)
 	if s.Where != nil {
+		w, err := resolveInSubqueries(acc, s.Where)
+		if err != nil {
+			return nil, err
+		}
+		s.Where = w
 		if err := validateExpr(sc, s.Where); err != nil {
 			return nil, err
 		}
@@ -1168,8 +1265,20 @@ func execDelete(acc storage.Accessor, s *parser.Delete) (*Result, error) {
 
 // --- Expression evaluation ---------------------------------------------------
 
+// groupCtx carries the current group's rows when evaluating expressions that
+// may contain aggregates (HAVING). nil = no group context (aggregates are
+// rejected).
+type groupCtx struct {
+	rows   [][]types.Value // all rows of the group
+	nowVal types.Value
+}
+
 // evalValue evaluates an expression against one (joined) row.
 func evalValue(sc *joinScope, e parser.Expr, row []types.Value) (types.Value, error) {
+	return evalValueCtx(sc, e, row, nil)
+}
+
+func evalValueCtx(sc *joinScope, e parser.Expr, row []types.Value, gc *groupCtx) (types.Value, error) {
 	switch x := e.(type) {
 	case *parser.Lit:
 		return x.V, nil
@@ -1181,18 +1290,36 @@ func evalValue(sc *joinScope, e parser.Expr, row []types.Value) (types.Value, er
 		return row[i], nil
 	case *parser.Func:
 		if x.Name == "now" {
+			if gc != nil {
+				return gc.nowVal, nil
+			}
 			return types.Time(time.Now().UTC()), nil
 		}
 		if parser.IsAggregateFunc(x.Name) {
-			return types.Null(), sqlErr("42883", fmt.Sprintf("aggregate function %s() is not allowed in this context", x.Name))
+			if gc == nil {
+				return types.Null(), sqlErr("42883", fmt.Sprintf("aggregate function %s() is not allowed in this context", x.Name))
+			}
+			pos := -1
+			if !x.Star {
+				ref, ok := x.Arg.(*parser.ColRef)
+				if !ok {
+					return types.Null(), sqlErr("42883", "aggregate argument must be a column reference in v2")
+				}
+				p, err := sc.resolve(ref)
+				if err != nil {
+					return types.Null(), err
+				}
+				pos = p
+			}
+			return evalAggregate(x, gc.rows, pos)
 		}
-		return types.Null(), sqlErr("42883", fmt.Sprintf("function %s() is not supported in v1", x.Name))
+		return types.Null(), sqlErr("42883", fmt.Sprintf("function %s() is not supported in v2", x.Name))
 	case *parser.Binary:
-		l, err := evalValue(sc, x.L, row)
+		l, err := evalValueCtx(sc, x.L, row, gc)
 		if err != nil {
 			return types.Null(), err
 		}
-		r, err := evalValue(sc, x.R, row)
+		r, err := evalValueCtx(sc, x.R, row, gc)
 		if err != nil {
 			return types.Null(), err
 		}
@@ -1256,13 +1383,17 @@ func arithmetic(op string, l, r types.Value) (types.Value, error) {
 // evalBool evaluates a boolean expression with SQL three-valued logic and
 // returns (value, isNull).
 func evalBool(sc *joinScope, e parser.Expr, row []types.Value) (bool, bool, error) {
+	return evalBoolCtx(sc, e, row, nil)
+}
+
+func evalBoolCtx(sc *joinScope, e parser.Expr, row []types.Value, gc *groupCtx) (bool, bool, error) {
 	switch x := e.(type) {
 	case *parser.Cmp:
-		l, err := evalValue(sc, x.L, row)
+		l, err := evalValueCtx(sc, x.L, row, gc)
 		if err != nil {
 			return false, false, err
 		}
-		r, err := evalValue(sc, x.R, row)
+		r, err := evalValueCtx(sc, x.R, row, gc)
 		if err != nil {
 			return false, false, err
 		}
@@ -1286,7 +1417,7 @@ func evalBool(sc *joinScope, e parser.Expr, row []types.Value) (bool, bool, erro
 		}
 		return false, false, sqlErr("0A000", "unknown comparison operator "+x.Op)
 	case *parser.IsNull:
-		v, err := evalValue(sc, x.X, row)
+		v, err := evalValueCtx(sc, x.X, row, gc)
 		if err != nil {
 			return false, false, err
 		}
@@ -1294,12 +1425,42 @@ func evalBool(sc *joinScope, e parser.Expr, row []types.Value) (bool, bool, erro
 			return !v.IsNull(), false, nil
 		}
 		return v.IsNull(), false, nil
-	case *parser.And:
-		lt, ln, err := evalBool(sc, x.L, row)
+	case *parser.InList:
+		v, err := evalValueCtx(sc, x.X, row, gc)
 		if err != nil {
 			return false, false, err
 		}
-		rt, rn, err := evalBool(sc, x.R, row)
+		if v.IsNull() {
+			return false, true, nil
+		}
+		matched, hasNull := false, false
+		for _, le := range x.List {
+			lit, ok := le.(*parser.Lit)
+			if !ok {
+				return false, false, sqlErr("42601", "IN list must contain literals in v2")
+			}
+			if lit.V.IsNull() {
+				hasNull = true
+				continue
+			}
+			if v.Compare(lit.V) == 0 {
+				matched = true
+				break
+			}
+		}
+		if !matched && hasNull {
+			return false, true, nil
+		}
+		if x.Not {
+			matched = !matched
+		}
+		return matched, false, nil
+	case *parser.And:
+		lt, ln, err := evalBoolCtx(sc, x.L, row, gc)
+		if err != nil {
+			return false, false, err
+		}
+		rt, rn, err := evalBoolCtx(sc, x.R, row, gc)
 		if err != nil {
 			return false, false, err
 		}
@@ -1308,11 +1469,11 @@ func evalBool(sc *joinScope, e parser.Expr, row []types.Value) (bool, bool, erro
 		}
 		return lt && rt, false, nil
 	case *parser.Or:
-		lt, ln, err := evalBool(sc, x.L, row)
+		lt, ln, err := evalBoolCtx(sc, x.L, row, gc)
 		if err != nil {
 			return false, false, err
 		}
-		rt, rn, err := evalBool(sc, x.R, row)
+		rt, rn, err := evalBoolCtx(sc, x.R, row, gc)
 		if err != nil {
 			return false, false, err
 		}
@@ -1321,7 +1482,7 @@ func evalBool(sc *joinScope, e parser.Expr, row []types.Value) (bool, bool, erro
 		}
 		return lt || rt, false, nil
 	case *parser.Not:
-		v, n, err := evalBool(sc, x.X, row)
+		v, n, err := evalBoolCtx(sc, x.X, row, gc)
 		if err != nil {
 			return false, false, err
 		}
@@ -1338,7 +1499,7 @@ func evalBool(sc *joinScope, e parser.Expr, row []types.Value) (bool, bool, erro
 		}
 		return false, false, sqlErr("42883", "expression is not boolean")
 	case *parser.Binary:
-		v, err := evalValue(sc, x, row)
+		v, err := evalValueCtx(sc, x, row, gc)
 		if err != nil {
 			return false, false, err
 		}
@@ -1357,6 +1518,175 @@ func evalBool(sc *joinScope, e parser.Expr, row []types.Value) (bool, bool, erro
 	default:
 		return false, false, sqlErr("0A000", "unsupported expression in boolean context")
 	}
+}
+
+// validateHaving checks a HAVING expression: aggregates and NOW() are allowed;
+// a plain column reference must be a GROUP BY column.
+func validateHaving(sc *joinScope, e parser.Expr, groupPosSet map[int]bool) error {
+	switch x := e.(type) {
+	case *parser.Lit:
+		return nil
+	case *parser.ColRef:
+		pos, err := sc.resolve(x)
+		if err != nil {
+			return err
+		}
+		if !groupPosSet[pos] {
+			return sqlErr("42803", fmt.Sprintf("column %q must appear in the GROUP BY clause or be used in an aggregate function", x.Name))
+		}
+		return nil
+	case *parser.Func:
+		switch {
+		case x.Name == "now":
+			return nil
+		case parser.IsAggregateFunc(x.Name):
+			_, err := validateAggregate(x, sc)
+			return err
+		default:
+			return sqlErr("42883", fmt.Sprintf("function %s() is not supported in HAVING", x.Name))
+		}
+	case *parser.Cmp:
+		if err := validateHaving(sc, x.L, groupPosSet); err != nil {
+			return err
+		}
+		return validateHaving(sc, x.R, groupPosSet)
+	case *parser.IsNull:
+		return validateHaving(sc, x.X, groupPosSet)
+	case *parser.And:
+		if err := validateHaving(sc, x.L, groupPosSet); err != nil {
+			return err
+		}
+		return validateHaving(sc, x.R, groupPosSet)
+	case *parser.Or:
+		if err := validateHaving(sc, x.L, groupPosSet); err != nil {
+			return err
+		}
+		return validateHaving(sc, x.R, groupPosSet)
+	case *parser.Not:
+		return validateHaving(sc, x.X, groupPosSet)
+	case *parser.Binary:
+		if err := validateHaving(sc, x.L, groupPosSet); err != nil {
+			return err
+		}
+		return validateHaving(sc, x.R, groupPosSet)
+	case *parser.InList:
+		if err := validateHaving(sc, x.X, groupPosSet); err != nil {
+			return err
+		}
+		for _, le := range x.List {
+			if _, ok := le.(*parser.Lit); !ok {
+				return sqlErr("42601", "IN list must contain literals in v2")
+			}
+		}
+		return nil
+	case *parser.InSub:
+		return validateHaving(sc, x.X, groupPosSet)
+	}
+	return nil
+}
+
+// resolveInSubqueries executes every IN-subquery in e against acc and
+// rewrites each into an equivalent literal InList (v2: non-correlated,
+// single column).
+func resolveInSubqueries(acc storage.Accessor, e parser.Expr) (parser.Expr, error) {
+	switch x := e.(type) {
+	case *parser.InSub:
+		res, err := execSelect(acc, x.Sub)
+		if err != nil {
+			return nil, err
+		}
+		if len(res.Columns) != 1 {
+			return nil, sqlErr("42601", "IN subquery must select exactly one column in v2")
+		}
+		lits := make([]parser.Expr, 0, len(res.Rows))
+		for _, r := range res.Rows {
+			lits = append(lits, &parser.Lit{V: r[0]})
+		}
+		return &parser.InList{X: x.X, List: lits, Not: x.Not}, nil
+	case *parser.Cmp:
+		l, err := resolveInSubqueries(acc, x.L)
+		if err != nil {
+			return nil, err
+		}
+		r, err := resolveInSubqueries(acc, x.R)
+		if err != nil {
+			return nil, err
+		}
+		x.L, x.R = l, r
+	case *parser.And:
+		l, err := resolveInSubqueries(acc, x.L)
+		if err != nil {
+			return nil, err
+		}
+		r, err := resolveInSubqueries(acc, x.R)
+		if err != nil {
+			return nil, err
+		}
+		x.L, x.R = l, r
+	case *parser.Or:
+		l, err := resolveInSubqueries(acc, x.L)
+		if err != nil {
+			return nil, err
+		}
+		r, err := resolveInSubqueries(acc, x.R)
+		if err != nil {
+			return nil, err
+		}
+		x.L, x.R = l, r
+	case *parser.Not:
+		n, err := resolveInSubqueries(acc, x.X)
+		if err != nil {
+			return nil, err
+		}
+		x.X = n
+	case *parser.IsNull:
+		n, err := resolveInSubqueries(acc, x.X)
+		if err != nil {
+			return nil, err
+		}
+		x.X = n
+	case *parser.Binary:
+		l, err := resolveInSubqueries(acc, x.L)
+		if err != nil {
+			return nil, err
+		}
+		r, err := resolveInSubqueries(acc, x.R)
+		if err != nil {
+			return nil, err
+		}
+		x.L, x.R = l, r
+	case *parser.InList:
+		n, err := resolveInSubqueries(acc, x.X)
+		if err != nil {
+			return nil, err
+		}
+		x.X = n
+	}
+	return e, nil
+}
+
+// derivedDef builds a synthetic table definition for a FROM subquery:
+// column names come from the subquery result headers, types are inferred
+// from the first row (text fallback when the result is empty).
+func derivedDef(alias string, res *Result) *schema.TableDef {
+	def := &schema.TableDef{Name: alias}
+	for i, h := range res.Columns {
+		ct := types.TypeText
+		if len(res.Rows) > 0 {
+			switch res.Rows[0][i].Kind {
+			case types.KindInt:
+				ct = types.TypeInt
+			case types.KindFloat:
+				ct = types.TypeFloat
+			case types.KindBool:
+				ct = types.TypeBool
+			case types.KindTime:
+				ct = types.TypeTimestamp
+			}
+		}
+		def.Cols = append(def.Cols, schema.Column{Name: h, Type: ct})
+	}
+	return def
 }
 
 // --- Aggregates ----------------------------------------------------------------

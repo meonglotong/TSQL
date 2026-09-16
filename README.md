@@ -4,7 +4,8 @@ Small but **real** relational SQL database server in Go, inspired by PostgreSQL.
 Runs on Tamami Linux 43, installs like `postgresql` (dnf + systemd), accessed via
 its own CLI `tsql` over a custom framed protocol.
 
-Status: **v1 complete** (Fase 0–4) — see [design spec](docs/superpowers/specs/2026-09-14-tsql-design.md).
+Status: **v1 complete** (Fase 0–4) + **v2 SQL extensions** (LEFT JOIN, HAVING,
+IN, subqueries) — see [design spec](docs/superpowers/specs/2026-09-14-tsql-design.md).
 
 ## What it does
 
@@ -41,13 +42,22 @@ Status: **v1 complete** (Fase 0–4) — see [design spec](docs/superpowers/spec
   on uninstall), and a quick `install.sh` for /usr/local installs.
 - Crash-safe persistence: WAL + snapshots, replay on startup (torn tails
   truncated; uncommitted txns dropped).
+- **v2 SQL extensions:**
+  - `LEFT [OUTER] JOIN` — unmatched left rows are kept, right side NULL.
+  - `HAVING` — filter on groups/aggregates (after GROUP BY, before ORDER BY
+    and LIMIT), also valid without GROUP BY (single implicit group).
+  - `expr [NOT] IN (list)` and `expr [NOT] IN (SELECT ...)` in WHERE/ON/HAVING
+    (non-correlated single-column subqueries; three-valued NULL semantics;
+    IN lists may mix with AND/OR, NOT IN, arithmetic).
+  - `SELECT ... FROM (SELECT ...) alias` — derived tables (alias required),
+    joinable and nestable.
 - Error codes follow PostgreSQL SQLSTATEs (42P01, 42P07, 42703, 22P02,
   23502, 23503, 23505, 25000, 25006, 42803, 42804, 42883, 22012, 21000, ...).
 - Own framed protocol (`[4-byte length][JSON]`) + `tsql` CLI with
   psql-style aligned tables.
 
-**Planned (v2, beyond the Fase 0–4 spec):** LEFT/OUTER JOIN, HAVING,
-subqueries, MVCC, per-connection auth.
+**Planned (v3, beyond the current scope):** MVCC, per-connection auth,
+correlated subqueries, output column aliases (`SELECT x AS y`), `EXISTS`.
 
 Full design: [spec](docs/superpowers/specs/2026-09-14-tsql-design.md).
 
@@ -71,8 +81,8 @@ The interactive REPL (`./bin/tsql`) supports psql-style meta-commands:
 
 ```bash
 dnf install -y rpm-build
-make dist-tarball && make rpm     # -> ~/rpmbuild/RPMS/x86_64/tsql-0.3.0-1.*.rpm
-sudo dnf install ~/rpmbuild/RPMS/x86_64/tsql-0.3.0-1.*.rpm
+make dist-tarball && make rpm     # -> ~/rpmbuild/RPMS/x86_64/tsql-0.4.0-1.*.rpm
+sudo dnf install ~/rpmbuild/RPMS/x86_64/tsql-0.4.0-1.*.rpm
 systemctl status tsqld
 ```
 
