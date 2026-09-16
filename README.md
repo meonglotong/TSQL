@@ -4,11 +4,11 @@ Small but **real** relational SQL database server in Go, inspired by PostgreSQL.
 Runs on Tamami Linux 43, installs like `postgresql` (dnf + systemd), accessed via
 its own CLI `tsql` over a custom framed protocol.
 
-Status: **under construction** — see [design spec](docs/superpowers/specs/2026-09-14-tsql-design.md).
+Status: **v1 complete** (Fase 0–4) — see [design spec](docs/superpowers/specs/2026-09-14-tsql-design.md).
 
 ## What it does
 
-**Implemented (Fase 0–3):**
+**Implemented (Fase 0–4):**
 
 - SQL: `CREATE TABLE`, `DROP TABLE [IF EXISTS]`, `INSERT ... VALUES` (multi-row),
   `UPDATE`, `DELETE`, `SELECT` with `WHERE`, `ORDER BY` (multi-key, ASC/DESC),
@@ -34,6 +34,11 @@ Status: **under construction** — see [design spec](docs/superpowers/specs/2026
   against the transaction's merged view, so same-txn parent+child inserts work.
 - **Multi-connection:** one goroutine per connection; concurrent clients with
   interleaved BEGIN/COMMIT cycles — no lost updates.
+- **Packaging (Fase 4):** systemd unit (`tsqld.service`, dedicated `tsql`
+  user, data in `/var/lib/tsql`, TCP `127.0.0.1:5433` + unix socket
+  `/run/tsql/tsqld.sock`), dnf-installable RPM (`packaging/tsql.spec`,
+  static CGO-less binaries, service auto-created + auto-started, data kept
+  on uninstall), and a quick `install.sh` for /usr/local installs.
 - Crash-safe persistence: WAL + snapshots, replay on startup (torn tails
   truncated; uncommitted txns dropped).
 - Error codes follow PostgreSQL SQLSTATEs (42P01, 42P07, 42703, 22P02,
@@ -41,7 +46,8 @@ Status: **under construction** — see [design spec](docs/superpowers/specs/2026
 - Own framed protocol (`[4-byte length][JSON]`) + `tsql` CLI with
   psql-style aligned tables.
 
-**Planned (Fase 4):** systemd unit + rpm packaging + `install.sh`.
+**Planned (v2, beyond the Fase 0–4 spec):** LEFT/OUTER JOIN, HAVING,
+subqueries, MVCC, per-connection auth.
 
 Full design: [spec](docs/superpowers/specs/2026-09-14-tsql-design.md).
 
@@ -55,13 +61,37 @@ make build
 ./bin/tsql -c "SELECT * FROM users"
 ```
 
+## Installation (Tamami Linux / RHEL-style)
+
+**RPM:**
+
+```bash
+dnf install -y rpm-build
+make dist-tarball && make rpm     # -> ~/rpmbuild/RPMS/x86_64/tsql-0.3.0-1.*.rpm
+sudo dnf install ~/rpmbuild/RPMS/x86_64/tsql-0.3.0-1.*.rpm
+systemctl status tsqld
+```
+
+The RPM creates the `tsql` system user and `/var/lib/tsql`, installs
+`tsqld.service` (listens on `127.0.0.1:5433` + unix socket
+`/run/tsql/tsqld.sock`) and starts it. The daemon checkpoints on SIGTERM and
+auto-restarts after a crash; the data directory is kept on uninstall.
+
+**Quick install (no rpm):**
+
+```bash
+sudo ./install.sh        # builds + installs to /usr/local/bin, unit + service
+```
+
 ## Layout
 
 ```
 cmd/tsqld        server daemon
 cmd/tsql         CLI client
 internal/...     parser, executor, storage (WAL+snapshots+txns), protocol
-docs/superpowers/specs/   design spec
+packaging/       systemd unit + RPM spec
+install.sh       quick /usr/local install
+docs/...         design spec
 ```
 
 ## Tests

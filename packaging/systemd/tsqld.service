@@ -1,0 +1,17 @@
+[Unit]
+Description=TSQL (tamamiSQL) database server
+Documentation=https://github.com/meonglotong/TSQL
+After=network.target
+
+[Service]
+Type=simple
+User=tsql
+Group=tsql
+RuntimeDirectory=tsql
+ExecStart=/usr/bin/tsqld -datadir /var/lib/tsql -listen 127.0.0.1:5433 -unixsocket /run/tsql/tsqld.sock
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
