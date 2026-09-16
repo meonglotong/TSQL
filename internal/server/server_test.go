@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 
@@ -245,4 +246,91 @@ func TestConcurrentClients(t *testing.T) {
 	c0.expectOK("COMMIT", 0)
 	// sum = (0+1+...+24)*4 + 25 (owner 1 bumped) = 1200 + 25
 	c0.expectInt("SELECT sum(v) FROM t", (0+1+2+3+4+5+6+7+8+9+10+11+12+13+14+15+16+17+18+19+20+21+22+23+24)*4+25)
+}
+
+func TestDescribeAndDatabases(t *testing.T) {
+	addr := startServer(t)
+	cl := dial(t, addr)
+	cl.expectOK("CREATE TABLE users (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT NOT NULL, score FLOAT UNIQUE)", 0)
+
+	// \l -> databases (single database in v1)
+	if err := protocol.WriteFrame(cl.conn, protocol.Message{Type: "databases"}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	seenDB := false
+	for {
+		m, err := protocol.ReadFrame(cl.conn)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if m.Type == "databases" {
+			seenDB = true
+			if len(m.Tables) != 1 || m.Tables[0] != "tsql" {
+				t.Errorf("databases = %v", m.Tables)
+			}
+		}
+		if m.Type == "ready" {
+			break
+		}
+	}
+	if !seenDB {
+		t.Fatal("no databases frame")
+	}
+
+	// \d users -> column listing
+	if err := protocol.WriteFrame(cl.conn, protocol.Message{Type: "describe", Name: "users"}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	seenDesc := false
+	for {
+		m, err := protocol.ReadFrame(cl.conn)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if m.Type == "describe" {
+			seenDesc = true
+			if m.Name != "users" {
+				t.Errorf("describe name = %q", m.Name)
+			}
+			flat := ""
+			for _, r := range m.Rows {
+				for _, c := range r {
+					flat += fmt.Sprint(c) + "|"
+				}
+			}
+			if !strings.Contains(flat, "id") || !strings.Contains(flat, "PK") ||
+				!strings.Contains(flat, "auto_increment") || !strings.Contains(flat, "UNI") {
+				t.Errorf("describe rows = %v", m.Rows)
+			}
+		}
+		if m.Type == "error" {
+			t.Fatalf("unexpected error frame: %+v", m)
+		}
+		if m.Type == "ready" {
+			break
+		}
+	}
+	if !seenDesc {
+		t.Fatal("no describe frame")
+	}
+
+	// \d nosuch -> 42P01
+	if err := protocol.WriteFrame(cl.conn, protocol.Message{Type: "describe", Name: "nosuch"}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	for {
+		m, err := protocol.ReadFrame(cl.conn)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if m.Type == "error" {
+			if m.Code != "42P01" {
+				t.Errorf("describe nosuch code = %s, want 42P01", m.Code)
+			}
+			break
+		}
+		if m.Type == "ready" {
+			break
+		}
+	}
 }

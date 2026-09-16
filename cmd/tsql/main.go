@@ -45,6 +45,13 @@ func main() {
 }
 
 func runOnce(conn net.Conn, sql string) int {
+	sql = strings.TrimSpace(sql)
+	for strings.HasSuffix(sql, ";") {
+		sql = strings.TrimSpace(sql[:len(sql)-1])
+	}
+	if sql == "" {
+		return 0
+	}
 	msgs, err := sendQuery(conn, sql)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "tsql: %v\n", err)
@@ -148,8 +155,59 @@ func joinPadded(cells []string, widths []int) string {
 	return strings.Join(parts, " | ")
 }
 
+// classifyLine maps one REPL line to an action:
+//
+//	quit     \q, quit, exit
+//	noop     empty line or bare semicolons
+//	tables   \dt / /dt / \dn (v1 has one schema, \dn lists tables)
+//	databases \l / \l+ / /l
+//	describe \d [table] / \d+ [table] / /d [table]
+//	help     \h, \help
+//	unknown  any other backslash/forward-slash command
+//	sql      everything else, with trailing semicolons stripped
+//
+// Forward slash is accepted as an alias for backslash (muscle memory).
+func classifyLine(line string) (kind, arg string) {
+	if strings.HasPrefix(line, "\\") || strings.HasPrefix(line, "/") {
+		body := strings.TrimSpace(line[1:])
+		parts := strings.SplitN(body, " ", 2)
+		cmd := strings.ToLower(parts[0])
+		cmd = strings.TrimSuffix(cmd, "+")
+		a := ""
+		if len(parts) > 1 {
+			a = strings.TrimSpace(parts[1])
+		}
+		switch cmd {
+		case "q":
+			return "quit", ""
+		case "dt", "dn":
+			return "tables", ""
+		case "l":
+			return "databases", ""
+		case "d":
+			return "describe", a
+		case "h", "help":
+			return "help", ""
+		default:
+			return "unknown", body
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "quit", "exit":
+		return "quit", ""
+	}
+	sql := strings.TrimSpace(line)
+	for strings.HasSuffix(sql, ";") {
+		sql = strings.TrimSpace(sql[:len(sql)-1])
+	}
+	if sql == "" {
+		return "noop", ""
+	}
+	return "sql", sql
+}
+
 func repl(conn net.Conn) {
-	fmt.Println("tsql — TSQL interactive terminal (\\q quit, \\dt tables)")
+	fmt.Println("tsql — TSQL interactive terminal (\\q quit, \\dt tables, \\d describe, \\h help)")
 	in := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Print("tsql> ")
@@ -164,19 +222,109 @@ func repl(conn net.Conn) {
 		if line == "" {
 			continue
 		}
-		switch line {
-		case "\\q", "quit", "exit":
+		kind, arg := classifyLine(line)
+		switch kind {
+		case "quit":
 			return
-		case "\\dt":
+		case "noop":
+			continue
+		case "tables":
 			listTables(conn)
 			continue
+		case "databases":
+			listDatabases(conn)
+			continue
+		case "describe":
+			if arg == "" {
+				listTables(conn)
+			} else {
+				describeTable(conn, arg)
+			}
+			continue
+		case "help":
+			printHelp()
+			continue
+		case "unknown":
+			fmt.Fprintf(os.Stderr, "tsql: unknown command %q (try \\h)\n", line)
+			continue
 		}
-		msgs, err := sendQuery(conn, line)
+		msgs, err := sendQuery(conn, arg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "tsql: connection error: %v\n", err)
 			return
 		}
 		printResults(os.Stdout, msgs)
+	}
+}
+
+func printHelp() {
+	fmt.Println(`commands:
+  \q           quit
+  \dt          list tables
+  \dn          list schemas (v1: single schema, lists tables)
+  \l           list databases (v1: single database)
+  \d [table]   describe a table (no arg: list tables)
+  \h           this help
+SQL statements take one line each; a trailing semicolon is optional.`)
+}
+
+// listDatabases shows the v1 database list (a single database: tsql).
+func listDatabases(conn net.Conn) {
+	if err := protocol.WriteFrame(conn, protocol.Message{Type: "databases"}); err != nil {
+		fmt.Fprintf(os.Stderr, "tsql: %v\n", err)
+		return
+	}
+	for {
+		m, err := protocol.ReadFrame(conn)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "tsql: %v\n", err)
+			return
+		}
+		if m.Type == "databases" {
+			if len(m.Tables) == 0 {
+				fmt.Println("(no databases)")
+				return
+			}
+			for _, d := range m.Tables {
+				fmt.Println(d)
+			}
+			return
+		}
+		if m.Type == "ready" {
+			return
+		}
+	}
+}
+
+// describeTable prints a table's column listing.
+func describeTable(conn net.Conn, name string) {
+	if err := protocol.WriteFrame(conn, protocol.Message{Type: "describe", Name: name}); err != nil {
+		fmt.Fprintf(os.Stderr, "tsql: %v\n", err)
+		return
+	}
+	for {
+		m, err := protocol.ReadFrame(conn)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "tsql: %v\n", err)
+			return
+		}
+		if m.Type == "describe" {
+			fmt.Printf("%s\n", m.Name)
+			if len(m.Rows) == 0 {
+				fmt.Println("(0 rows)")
+				return
+			}
+			fmt.Fprint(os.Stdout, formatTable(m.Columns, m.Rows))
+			fmt.Fprintf(os.Stdout, "(%d row%s)\n", len(m.Rows), plural(len(m.Rows)))
+			return
+		}
+		if m.Type == "error" {
+			fmt.Fprintf(os.Stderr, "ERROR [%s]: %s\n", m.Code, m.Message)
+			return
+		}
+		if m.Type == "ready" {
+			return
+		}
 	}
 }
 

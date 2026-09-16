@@ -5,6 +5,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/meonglotong/tsql/internal/executor"
 	"github.com/meonglotong/tsql/internal/parser"
 	"github.com/meonglotong/tsql/internal/protocol"
+	"github.com/meonglotong/tsql/internal/schema"
 	"github.com/meonglotong/tsql/internal/storage"
 	"github.com/meonglotong/tsql/internal/types"
 )
@@ -92,10 +94,63 @@ func (s *Server) dispatch(st *connState, msg protocol.Message) {
 		}
 		protocol.WriteFrame(st.c, protocol.Message{Type: "tables", Tables: names})
 		s.ready(st)
+	case "databases":
+		// v1: a single database named tsql.
+		protocol.WriteFrame(st.c, protocol.Message{Type: "databases", Tables: []string{"tsql"}})
+		s.ready(st)
+	case "describe":
+		s.runDescribe(st, msg.Name)
 	default:
 		protocol.WriteFrame(st.c, protocol.Message{Type: "error", Code: "0A000", Message: "unknown message type " + msg.Type})
 		s.ready(st)
 	}
+}
+
+// runDescribe answers a \d request: the column listing of one table.
+func (s *Server) runDescribe(st *connState, name string) {
+	var def *schema.TableDef
+	for _, d := range s.eng.Catalog() {
+		if d.Name == name {
+			dd := d
+			def = &dd
+			break
+		}
+	}
+	if def == nil {
+		protocol.WriteFrame(st.c, protocol.Message{Type: "error", Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", name)})
+		s.ready(st)
+		return
+	}
+	rows := make([][]any, 0, len(def.Cols))
+	for _, c := range def.Cols {
+		key := ""
+		if c.Primary {
+			key = "PK"
+		} else if c.Unique {
+			key = "UNI"
+		}
+		null := "yes"
+		if c.NotNull || c.Primary {
+			null = "no"
+		}
+		extra := ""
+		if c.AutoInc {
+			extra = "auto_increment"
+		}
+		if c.FKTable != "" {
+			if extra != "" {
+				extra += " "
+			}
+			extra += "references " + c.FKTable + "(" + c.FKCol + ")"
+		}
+		rows = append(rows, []any{c.Name, string(c.Type), key, null, extra})
+	}
+	protocol.WriteFrame(st.c, protocol.Message{
+		Type: "describe", Name: def.Name,
+		Columns: []string{"column", "type", "key", "null", "extra"},
+		Rows:    rows,
+	})
+	s.ready(st)
 }
 
 // fail sends an error frame, aborting the connection's transaction if one is

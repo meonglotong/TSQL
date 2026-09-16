@@ -14,11 +14,13 @@ import (
 const MaxFrame = 16 << 20
 
 // Message is one wire message (client->server or server->client).
-// Client->server: {"type":"query","sql":"..."} or {"type":"tables"}.
-// Server->client: result | ok | error | ready | tables.
+// Client->server: {"type":"query","sql":"..."} or {"type":"tables"} or
+// {"type":"describe","name":"..."} or {"type":"databases"}.
+// Server->client: result | ok | error | ready | tables | databases | describe.
 type Message struct {
 	Type     string   `json:"type"`
 	SQL      string   `json:"sql,omitempty"`
+	Name     string   `json:"name,omitempty"`
 	Columns  []string `json:"columns,omitempty"`
 	Rows     [][]any  `json:"rows,omitempty"`
 	Affected int      `json:"affected,omitempty"`

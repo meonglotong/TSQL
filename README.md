@@ -61,6 +61,10 @@ make build
 ./bin/tsql -c "SELECT * FROM users"
 ```
 
+The interactive REPL (`./bin/tsql`) supports psql-style meta-commands:
+`\q`, `\dt` (tables), `\dn` (schemas), `\l` (databases), `\d [table]`
+(describe), `\h` (help). A trailing semicolon is optional.
+
 ## Installation (Tamami Linux / RHEL-style)
 
 **RPM:**
