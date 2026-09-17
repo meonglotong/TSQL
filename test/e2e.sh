@@ -128,6 +128,14 @@ assert_fail "SELECT name FROM (SELECT id FROM v2u)" "derived-no-alias"
 assert "UPDATE v2u SET dept = 'hr' WHERE id IN (SELECT uid FROM v2o)" "OK (2 rows)" "update-in-subquery"
 assert "SELECT dept FROM v2u WHERE id = 3" "sales" "update-in-subquery-check"
 
+# --- Fase v3.1: output column aliases ---------------------------------------
+assert "SELECT name AS nama FROM v2u WHERE id = 1" "nama" "alias-header"
+assert "SELECT name AS nama FROM v2u WHERE id = 1" "alfa" "alias-value"
+assert "SELECT count(*) total FROM v2u" "total" "alias-agg-header"
+assert "SELECT count(*) total FROM v2u" "3" "alias-agg-value"
+assert "SELECT s.nm FROM (SELECT id, name AS nm FROM v2u) s WHERE s.id = 3" "cuki" "alias-derived"
+assert_fail "SELECT * AS allcols FROM v2u" "alias-star-rejected"
+
 # --- crash recovery: kill -9, restart, data must survive ---------------------
 kill -9 "$DAEMON_PID" 2>/dev/null || true
 wait "$DAEMON_PID" 2>/dev/null || true

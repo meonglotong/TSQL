@@ -732,3 +732,48 @@ func TestIn(t *testing.T) {
 		t.Fatalf("rows = %+v", r7.Rows)
 	}
 }
+
+func TestSelectAlias(t *testing.T) {
+	e := newEng(t)
+	run(t, e, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, dept TEXT)")
+	run(t, e, "INSERT INTO users VALUES (1, 'alfa', 'eng'), (2, 'beta', 'eng'), (3, 'cuki', 'sales')")
+
+	// AS alias renames the output column
+	r := run(t, e, "SELECT name AS nama FROM users ORDER BY id")
+	if len(r.Columns) != 1 || r.Columns[0] != "nama" {
+		t.Fatalf("columns = %v", r.Columns)
+	}
+	if len(r.Rows) != 3 || r.Rows[0][0].S != "alfa" {
+		t.Fatalf("rows = %+v", r.Rows)
+	}
+
+	// bare alias, multiple fields
+	r2 := run(t, e, "SELECT name nm, dept d FROM users WHERE id = 1")
+	if r2.Columns[0] != "nm" || r2.Columns[1] != "d" {
+		t.Fatalf("columns = %v", r2.Columns)
+	}
+	if r2.Rows[0][0].S != "alfa" || r2.Rows[0][1].S != "eng" {
+		t.Fatalf("rows = %+v", r2.Rows)
+	}
+
+	// alias on aggregate
+	r3 := run(t, e, "SELECT dept, count(*) total FROM users GROUP BY dept ORDER BY dept")
+	if r3.Columns[1] != "total" {
+		t.Fatalf("columns = %v", r3.Columns)
+	}
+	if r3.Rows[0][0].S != "eng" || r3.Rows[0][1].I != 2 {
+		t.Fatalf("rows = %+v", r3.Rows)
+	}
+
+	// derived table adopts aliased column names
+	r4 := run(t, e, "SELECT s.nm FROM (SELECT id, name AS nm FROM users) s WHERE s.id = 3")
+	if len(r4.Rows) != 1 || r4.Rows[0][0].S != "cuki" {
+		t.Fatalf("rows = %+v", r4.Rows)
+	}
+
+	// no alias keeps original header
+	r5 := run(t, e, "SELECT name FROM users WHERE id = 1")
+	if r5.Columns[0] != "name" {
+		t.Fatalf("columns = %v", r5.Columns)
+	}
+}

@@ -85,16 +85,17 @@ type TableRef struct {
 
 // Select is SELECT.
 type Select struct {
-	Tables    []TableRef // FROM + joined tables, in order
-	On        []Expr     // ON expr for Tables[i+1], aligned: On[i] joins Tables[i+1]
-	JoinKinds []string   // aligned with On: "inner" (default) or "left"
-	Star      bool
-	Fields    []Expr // ignored when Star
-	Where     Expr
-	Group     []Expr // v1: column references only
-	Having    Expr   // filter on groups/aggregates
-	Order     []OrderTerm
-	Limit     *int64
+	Tables       []TableRef // FROM + joined tables, in order
+	On           []Expr     // ON expr for Tables[i+1], aligned: On[i] joins Tables[i+1]
+	JoinKinds    []string   // aligned with On: "inner" (default) or "left"
+	Star         bool
+	Fields       []Expr     // ignored when Star
+	FieldAliases []string   // aligned with Fields; "" = no alias
+	Where        Expr
+	Group        []Expr     // v1: column references only
+	Having       Expr       // filter on groups/aggregates
+	Order        []OrderTerm
+	Limit        *int64
 }
 
 // OrderTerm is one ORDER BY item (column ref or aggregate in v1).
@@ -408,6 +409,13 @@ var refStopWords = map[string]bool{
 	"in": true, "not": true,
 }
 
+// fieldStopWords are clause keywords that must not be consumed as a column
+// alias after a select-list field.
+var fieldStopWords = map[string]bool{
+	"from": true, "where": true, "group": true, "having": true,
+	"order": true, "limit": true,
+}
+
 func (p *parser) parseStatement() (Statement, error) {
 	switch {
 	case p.atKw("create"):
@@ -660,6 +668,20 @@ func (p *parser) parseTableRef() (TableRef, error) {
 	return ref, nil
 }
 
+// parseOptionalAlias reads an optional "AS ident" or bare-ident alias after
+// a select-list field. Returns "" when there is no alias.
+func (p *parser) parseOptionalAlias() (string, error) {
+	if p.atKw("as") {
+		p.next()
+		return p.identOrErr("column alias")
+	}
+	if p.peek().kind == tokIdent && !fieldStopWords[p.peek().text] {
+		t := p.next()
+		return t.text, nil
+	}
+	return "", nil
+}
+
 func (p *parser) parseSelect() (*Select, error) {
 	p.next() // select
 	st := &Select{}
@@ -673,6 +695,11 @@ func (p *parser) parseSelect() (*Select, error) {
 				return nil, err
 			}
 			st.Fields = append(st.Fields, e)
+			al, err := p.parseOptionalAlias()
+			if err != nil {
+				return nil, err
+			}
+			st.FieldAliases = append(st.FieldAliases, al)
 			if p.atPunct(",") {
 				p.next()
 				continue

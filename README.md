@@ -5,7 +5,8 @@ Runs on Tamami Linux 43, installs like `postgresql` (dnf + systemd), accessed vi
 its own CLI `tsql` over a custom framed protocol.
 
 Status: **v1 complete** (Fase 0–4) + **v2 SQL extensions** (LEFT JOIN, HAVING,
-IN, subqueries) — see [design spec](docs/superpowers/specs/2026-09-14-tsql-design.md).
+IN, subqueries) + **output column aliases** — see
+[design spec](docs/superpowers/specs/2026-09-14-tsql-design.md).
 
 ## What it does
 
@@ -51,13 +52,16 @@ IN, subqueries) — see [design spec](docs/superpowers/specs/2026-09-14-tsql-des
     IN lists may mix with AND/OR, NOT IN, arithmetic).
   - `SELECT ... FROM (SELECT ...) alias` — derived tables (alias required),
     joinable and nestable.
+- **Output column aliases (v0.5.0):** `expr [AS] alias` in SELECT lists
+  (bare or `AS`), including aggregates and expressions; aliases on
+  derived-table columns propagate to outer queries (`SELECT id AS uid FROM ...`).
 - Error codes follow PostgreSQL SQLSTATEs (42P01, 42P07, 42703, 22P02,
   23502, 23503, 23505, 25000, 25006, 42803, 42804, 42883, 22012, 21000, ...).
 - Own framed protocol (`[4-byte length][JSON]`) + `tsql` CLI with
   psql-style aligned tables.
 
 **Planned (v3, beyond the current scope):** MVCC, per-connection auth,
-correlated subqueries, output column aliases (`SELECT x AS y`), `EXISTS`.
+correlated subqueries, `ORDER BY` alias/position, `EXISTS`.
 
 Full design: [spec](docs/superpowers/specs/2026-09-14-tsql-design.md).
 
@@ -81,8 +85,8 @@ The interactive REPL (`./bin/tsql`) supports psql-style meta-commands:
 
 ```bash
 dnf install -y rpm-build
-make dist-tarball && make rpm     # -> ~/rpmbuild/RPMS/x86_64/tsql-0.4.0-1.*.rpm
-sudo dnf install ~/rpmbuild/RPMS/x86_64/tsql-0.4.0-1.*.rpm
+make dist-tarball && make rpm     # -> ~/rpmbuild/RPMS/x86_64/tsql-0.5.0-1.*.rpm
+sudo dnf install ~/rpmbuild/RPMS/x86_64/tsql-0.5.0-1.*.rpm
 systemctl status tsqld
 ```
 

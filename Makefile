@@ -1,5 +1,5 @@
 GO ?= go
-VERSION ?= 0.4.0
+VERSION ?= 0.5.0
 DISTDIR := dist
 
 .PHONY: build test vet fmt e2e dist-tarball rpm

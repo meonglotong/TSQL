@@ -531,7 +531,11 @@ func (sc *joinScope) planFields(s *parser.Select, grouping bool, groupPosSet map
 		}
 		return plans, headers, nil
 	}
-	for _, f := range s.Fields {
+	for i, f := range s.Fields {
+		alias := ""
+		if i < len(s.FieldAliases) {
+			alias = s.FieldAliases[i]
+		}
 		switch x := f.(type) {
 		case *parser.ColRef:
 			pos, err := sc.resolve(x)
@@ -541,11 +545,19 @@ func (sc *joinScope) planFields(s *parser.Select, grouping bool, groupPosSet map
 			if grouping && !groupPosSet[pos] {
 				return nil, nil, sqlErr("42803", fmt.Sprintf("column %q must appear in the GROUP BY clause or be used in an aggregate function", x.Name))
 			}
-			add(fieldPlan{kind: fieldCol, pos: pos}, sc.headerAt(pos))
+			h := sc.headerAt(pos)
+			if alias != "" {
+				h = alias
+			}
+			add(fieldPlan{kind: fieldCol, pos: pos}, h)
 		case *parser.Func:
 			switch {
 			case x.Name == "now":
-				add(fieldPlan{kind: fieldNow}, "now()")
+				h := "now()"
+				if alias != "" {
+					h = alias
+				}
+				add(fieldPlan{kind: fieldNow}, h)
 			case parser.IsAggregateFunc(x.Name):
 				if !grouping {
 					return nil, nil, sqlErr("42803", "aggregate functions require GROUP BY in v1")
@@ -554,7 +566,11 @@ func (sc *joinScope) planFields(s *parser.Select, grouping bool, groupPosSet map
 				if err != nil {
 					return nil, nil, err
 				}
-				add(fieldPlan{kind: fieldAgg, pos: pos, agg: x}, aggHeader(x))
+				h := aggHeader(x)
+				if alias != "" {
+					h = alias
+				}
+				add(fieldPlan{kind: fieldAgg, pos: pos, agg: x}, h)
 			default:
 				return nil, nil, sqlErr("42883", fmt.Sprintf("function %s() is not supported in v1", x.Name))
 			}
@@ -565,7 +581,11 @@ func (sc *joinScope) planFields(s *parser.Select, grouping bool, groupPosSet map
 			if err := validateExpr(sc, f); err != nil {
 				return nil, nil, err
 			}
-			add(fieldPlan{kind: fieldExpr, expr: f}, "expr")
+			h := "expr"
+			if alias != "" {
+				h = alias
+			}
+			add(fieldPlan{kind: fieldExpr, expr: f}, h)
 		}
 	}
 	return plans, headers, nil

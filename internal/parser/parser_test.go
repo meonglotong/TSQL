@@ -471,3 +471,50 @@ func TestParseIn(t *testing.T) {
 		t.Fatalf("Where = %+v", st4.Where)
 	}
 }
+
+func TestParseSelectAlias(t *testing.T) {
+	// AS alias
+	st, ok := mustParse(t, "SELECT name AS nama FROM users").(*Select)
+	if !ok {
+		t.Fatal("not a Select")
+	}
+	if len(st.Fields) != 1 || len(st.FieldAliases) != 1 || st.FieldAliases[0] != "nama" {
+		t.Fatalf("FieldAliases = %+v", st.FieldAliases)
+	}
+
+	// bare aliases (no AS)
+	st2, ok := mustParse(t, "SELECT name nm, dept d FROM users").(*Select)
+	if !ok {
+		t.Fatal("not a Select")
+	}
+	if len(st2.FieldAliases) != 2 || st2.FieldAliases[0] != "nm" || st2.FieldAliases[1] != "d" {
+		t.Fatalf("FieldAliases = %+v", st2.FieldAliases)
+	}
+
+	// no alias -> empty string
+	st3, ok := mustParse(t, "SELECT name FROM users").(*Select)
+	if !ok {
+		t.Fatal("not a Select")
+	}
+	if len(st3.FieldAliases) != 1 || st3.FieldAliases[0] != "" {
+		t.Fatalf("FieldAliases = %+v", st3.FieldAliases)
+	}
+
+	// alias on aggregate
+	st4, ok := mustParse(t, "SELECT count(*) total FROM users").(*Select)
+	if !ok {
+		t.Fatal("not a Select")
+	}
+	if st4.FieldAliases[0] != "total" {
+		t.Fatalf("FieldAliases = %+v", st4.FieldAliases)
+	}
+
+	// clause keyword must not be eaten as alias
+	st5, ok := mustParse(t, "SELECT id FROM t ORDER BY id").(*Select)
+	if !ok {
+		t.Fatal("not a Select")
+	}
+	if st5.FieldAliases[0] != "" {
+		t.Fatalf("'from' eaten as alias: %+v", st5.FieldAliases)
+	}
+}
