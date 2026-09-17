@@ -1,8 +1,14 @@
+<div align="center">
+
+![TSQL](docs/logo.png)
+
 # TSQL (tamamiSQL)
 
 Small but **real** relational SQL database server in Go, inspired by PostgreSQL.
 Runs on Tamami Linux 43, installs like `postgresql` (dnf + systemd), accessed via
 its own CLI `tsql` over a custom framed protocol.
+
+</div>
 
 Status: **v1 complete** (Fase 0–4) + **v2 SQL extensions** (LEFT JOIN, HAVING,
 IN, subqueries) + **output column aliases** — see
@@ -85,8 +91,8 @@ The interactive REPL (`./bin/tsql`) supports psql-style meta-commands:
 
 ```bash
 dnf install -y rpm-build
-make dist-tarball && make rpm     # -> ~/rpmbuild/RPMS/x86_64/tsql-0.5.0-1.*.rpm
-sudo dnf install ~/rpmbuild/RPMS/x86_64/tsql-0.5.0-1.*.rpm
+make dist-tarball && make rpm     # -> ~/rpmbuild/RPMS/x86_64/tsql-0.5.1-1.*.rpm
+sudo dnf install ~/rpmbuild/RPMS/x86_64/tsql-0.5.1-1.*.rpm
 systemctl status tsqld
 ```
 

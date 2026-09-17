@@ -89,11 +89,11 @@ type Select struct {
 	On           []Expr     // ON expr for Tables[i+1], aligned: On[i] joins Tables[i+1]
 	JoinKinds    []string   // aligned with On: "inner" (default) or "left"
 	Star         bool
-	Fields       []Expr     // ignored when Star
-	FieldAliases []string   // aligned with Fields; "" = no alias
+	Fields       []Expr   // ignored when Star
+	FieldAliases []string // aligned with Fields; "" = no alias
 	Where        Expr
-	Group        []Expr     // v1: column references only
-	Having       Expr       // filter on groups/aggregates
+	Group        []Expr // v1: column references only
+	Having       Expr   // filter on groups/aggregates
 	Order        []OrderTerm
 	Limit        *int64
 }
